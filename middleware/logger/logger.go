@@ -18,79 +18,46 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// Config defines the config for middleware.
-type Config struct {
-	// Next defines a function to skip this middleware when returned true.
-	//
-	// Optional. Default: nil
-	Next func(c *fiber.Ctx) bool
-
-	// Format defines the logging tags
-	//
-	// Optional. Default: [${time}] ${status} - ${latency} ${method} ${path}\n
-	Format string
-
-	// TimeFormat https://programming.guide/go/format-parse-string-time-date-example.html
-	//
-	// Optional. Default: 15:04:05
-	TimeFormat string
-
-	// TimeZone can be specified, such as "UTC" and "America/New_York" and "Asia/Chongqing", etc
-	//
-	// Optional. Default: "Local"
-	TimeZone string
-	// Output is a writter where logs are written
-	//
-	// Default: os.Stderr
-	Output io.Writer
-
-	enableColors     bool
-	enableLatency    bool
-	timeZoneLocation *time.Location
-}
-
-// ConfigDefault is the default config
-var ConfigDefault = Config{
-	Next:       nil,
-	Format:     "[${time}] ${status} - ${latency} ${method} ${path}\n",
-	TimeFormat: "15:04:05",
-	TimeZone:   "Local",
-	Output:     os.Stderr,
-}
-
 // Logger variables
 const (
-	TagPid           = "pid"
-	TagTime          = "time"
-	TagReferer       = "referer"
-	TagProtocol      = "protocol"
-	TagIP            = "ip"
-	TagIPs           = "ips"
-	TagHost          = "host"
-	TagMethod        = "method"
-	TagPath          = "path"
-	TagURL           = "url"
-	TagUA            = "ua"
-	TagLatency       = "latency"
-	TagStatus        = "status"
-	TagBody          = "body"
-	TagBytesSent     = "bytesSent"
-	TagBytesReceived = "bytesReceived"
-	TagRoute         = "route"
-	TagError         = "error"
-	TagHeader        = "header:"
-	TagQuery         = "query:"
-	TagForm          = "form:"
-	TagCookie        = "cookie:"
-	TagBlack         = "black"
-	TagRed           = "red"
-	TagGreen         = "green"
-	TagYellow        = "yellow"
-	TagBlue          = "blue"
-	TagMagenta       = "magenta"
-	TagCyan          = "cyan"
-	TagWhite         = "white"
-	TagReset         = "reset"
+	TagPid               = "pid"
+	TagTime              = "time"
+	TagReferer           = "referer"
+	TagProtocol          = "protocol"
+	TagPort              = "port"
+	TagIP                = "ip"
+	TagIPs               = "ips"
+	TagHost              = "host"
+	TagMethod            = "method"
+	TagPath              = "path"
+	TagURL               = "url"
+	TagUA                = "ua"
+	TagLatency           = "latency"
+	TagStatus            = "status"
+	TagResBody           = "resBody"
+	TagQueryStringParams = "queryParams"
+	TagBody              = "body"
+	TagBytesSent         = "bytesSent"
+	TagBytesReceived     = "bytesReceived"
+	TagRoute             = "route"
+	TagError             = "error"
+	// DEPRECATED: Use TagReqHeader instead
+	TagHeader     = "header:"
+	TagReqHeader  = "reqHeader:"
+	TagRespHeader = "respHeader:"
+	TagLocals     = "locals:"
+	TagQuery      = "query:"
+	TagForm       = "form:"
+	TagCookie     = "cookie:"
+	TagBlack      = "black"
+	TagRed        = "red"
+	TagGreen      = "green"
+	TagYellow     = "yellow"
+	TagBlue       = "blue"
+	TagMagenta    = "magenta"
+	TagCyan       = "cyan"
+	TagWhite      = "white"
+	TagReset      = "reset"
 )
 
 // Color values
@@ -109,36 +76,7 @@ const (
 // New creates a new middleware handler
 func New(config ...Config) fiber.Handler {
 	// Set default config
-	cfg := ConfigDefault
-
-	// Override config if provided
-	if len(config) > 0 {
-		cfg = config[0]
-
-		// Enable colors if no custom format or output is given
-		if cfg.Format == "" && cfg.Output == nil {
-			cfg.enableColors = true
-		}
-
-		// Set default values
-		if cfg.Next == nil {
-			cfg.Next = ConfigDefault.Next
-		}
-		if cfg.Format == "" {
-			cfg.Format = ConfigDefault.Format
-		}
-		if cfg.TimeZone == "" {
-			cfg.TimeZone = ConfigDefault.TimeZone
-		}
-		if cfg.TimeFormat == "" {
-			cfg.TimeFormat = ConfigDefault.TimeFormat
-		}
-		if cfg.Output == nil {
-			cfg.Output = ConfigDefault.Output
-		}
-	} else {
-		cfg.enableColors = true
-	}
+	cfg := configDefault(config...)
 
 	// Get timezone location
 	tz, err := time.LoadLocation(cfg.TimeZone)
@@ -162,7 +100,7 @@ func New(config ...Config) fiber.Handler {
 	if strings.Contains(cfg.Format, "${time}") {
 		go func() {
 			for {
-				time.Sleep(750 * time.Millisecond)
+				time.Sleep(cfg.TimeInterval)
 				timestamp.Store(time.Now().In(cfg.timeZoneLocation).Format(cfg.TimeFormat))
 			}
 		}()
@@ -173,9 +111,9 @@ func New(config ...Config) fiber.Handler {
 
 	// Set variables
 	var (
-		start, stop time.Time
-		once        sync.Once
-		errHandler  fiber.ErrorHandler
+		once       sync.Once
+		mu         sync.Mutex
+		errHandler fiber.ErrorHandler
 	)
 
 	// If colors are enabled, check terminal compatibility
@@ -196,7 +134,7 @@ func New(config ...Config) fiber.Handler {
 
 		// Set error handler once
 		once.Do(func() {
-			errHandler = c.App().Config().ErrorHandler
+			// get longested possible path
 			stack := c.App().Stack()
 			for m := range stack {
 				for r := range stack[m] {
@@ -206,8 +144,11 @@ func New(config ...Config) fiber.Handler {
 					}
 				}
 			}
-
+			// override error handler
+			errHandler = c.App().Config().ErrorHandler
 		})
+
+		var start, stop time.Time
 
 		// Set latency start time
 		if cfg.enableLatency {
@@ -272,6 +213,8 @@ func New(config ...Config) fiber.Handler {
 				return buf.WriteString(c.Protocol())
 			case TagPid:
 				return buf.WriteString(pid)
+			case TagPort:
+				return buf.WriteString(c.Port())
 			case TagIP:
 				return buf.WriteString(c.IP())
 			case TagIPs:
@@ -296,6 +239,10 @@ func New(config ...Config) fiber.Handler {
 				return buf.WriteString(c.Route().Path)
 			case TagStatus:
 				return appendInt(buf, c.Response().StatusCode())
+			case TagResBody:
+				return buf.Write(c.Response().Body())
+			case TagQueryStringParams:
+				return buf.WriteString(c.Request().URI().QueryArgs().String())
 			case TagMethod:
 				return buf.WriteString(c.Method())
 			case TagBlack:
@@ -322,16 +269,31 @@ func New(config ...Config) fiber.Handler {
 				}
 				return buf.WriteString("-")
 			default:
-				// Check if we have a value tag i.e.: "header:x-key"
+				// Check if we have a value tag i.e.: "reqHeader:x-key"
 				switch {
+				case strings.HasPrefix(tag, TagReqHeader):
+					return buf.WriteString(c.Get(tag[10:]))
 				case strings.HasPrefix(tag, TagHeader):
 					return buf.WriteString(c.Get(tag[7:]))
+				case strings.HasPrefix(tag, TagRespHeader):
+					return buf.WriteString(c.GetRespHeader(tag[11:]))
 				case strings.HasPrefix(tag, TagQuery):
 					return buf.WriteString(c.Query(tag[6:]))
 				case strings.HasPrefix(tag, TagForm):
 					return buf.WriteString(c.FormValue(tag[5:]))
 				case strings.HasPrefix(tag, TagCookie):
 					return buf.WriteString(c.Cookies(tag[7:]))
+				case strings.HasPrefix(tag, TagLocals):
+					switch v := c.Locals(tag[7:]).(type) {
+					case []byte:
+						return buf.Write(v)
+					case string:
+						return buf.WriteString(v)
+					case nil:
+						return 0, nil
+					default:
+						return buf.WriteString(fmt.Sprintf("%v", v))
+					}
 				}
 			}
 			return 0, nil
@@ -340,14 +302,16 @@ func New(config ...Config) fiber.Handler {
 		if err != nil {
 			_, _ = buf.WriteString(err.Error())
 		}
+		mu.Lock()
 		// Write buffer to output
 		if _, err := cfg.Output.Write(buf.Bytes()); err != nil {
 			// Write error to output
 			if _, err := cfg.Output.Write([]byte(err.Error())); err != nil {
 				// There is something wrong with the given io.Writer
-				// TODO: What should we do here?
+				fmt.Fprintf(os.Stderr, "Failed to write to log, %v\n", err)
 			}
 		}
+		mu.Unlock()
 		// Put buffer back to pool
 		bytebufferpool.Put(buf)
 
