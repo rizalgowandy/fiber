@@ -1,7 +1,6 @@
 package monitor
 
 import (
-	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -9,6 +8,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/internal/gopsutil/cpu"
+	"github.com/gofiber/fiber/v2/internal/gopsutil/load"
 	"github.com/gofiber/fiber/v2/internal/gopsutil/mem"
 	"github.com/gofiber/fiber/v2/internal/gopsutil/net"
 	"github.com/gofiber/fiber/v2/internal/gopsutil/process"
@@ -24,20 +24,25 @@ type statsPID struct {
 	RAM   uint64  `json:"ram"`
 	Conns int     `json:"conns"`
 }
+
 type statsOS struct {
-	CPU   float64 `json:"cpu"`
-	RAM   uint64  `json:"ram"`
-	Conns int     `json:"conns"`
+	CPU      float64 `json:"cpu"`
+	RAM      uint64  `json:"ram"`
+	TotalRAM uint64  `json:"total_ram"`
+	LoadAvg  float64 `json:"load_avg"`
+	Conns    int     `json:"conns"`
 }
 
 var (
-	monitPidCpu   atomic.Value
-	monitPidRam   atomic.Value
-	monitPidConns atomic.Value
+	monitPIDCPU   atomic.Value
+	monitPIDRAM   atomic.Value
+	monitPIDConns atomic.Value
 
-	monitOsCpu   atomic.Value
-	monitOsRam   atomic.Value
-	monitOsConns atomic.Value
+	monitOSCPU      atomic.Value
+	monitOSRAM      atomic.Value
+	monitOSTotalRAM atomic.Value
+	monitOSLoadAvg  atomic.Value
+	monitOSConns    atomic.Value
 )
 
 var (
@@ -47,62 +52,85 @@ var (
 )
 
 // New creates a new middleware handler
-func New() fiber.Handler {
+func New(config ...Config) fiber.Handler {
+	// Set default config
+	cfg := configDefault(config...)
+
 	// Start routine to update statistics
 	once.Do(func() {
-		fmt.Println("[Warning] monitor is still in beta, API might change in the future!")
-
-		p, _ := process.NewProcess(int32(os.Getpid()))
+		p, _ := process.NewProcess(int32(os.Getpid())) //nolint:errcheck // TODO: Handle error
 
 		updateStatistics(p)
 
 		go func() {
 			for {
-				updateStatistics(p)
+				time.Sleep(cfg.Refresh)
 
-				time.Sleep(1 * time.Second)
+				updateStatistics(p)
 			}
 		}()
 	})
 
 	// Return new handler
+	//nolint:errcheck // Ignore the type-assertion errors
 	return func(c *fiber.Ctx) error {
+		// Don't execute middleware if Next returns true
+		if cfg.Next != nil && cfg.Next(c) {
+			return c.Next()
+		}
+
 		if c.Method() != fiber.MethodGet {
 			return fiber.ErrMethodNotAllowed
 		}
-		if c.Get(fiber.HeaderAccept) == fiber.MIMEApplicationJSON {
+		if c.Get(fiber.HeaderAccept) == fiber.MIMEApplicationJSON || cfg.APIOnly {
 			mutex.Lock()
-			data.PID.CPU = monitPidCpu.Load().(float64)
-			data.PID.RAM = monitPidRam.Load().(uint64)
-			data.PID.Conns = monitPidConns.Load().(int)
+			data.PID.CPU, _ = monitPIDCPU.Load().(float64)
+			data.PID.RAM, _ = monitPIDRAM.Load().(uint64)
+			data.PID.Conns, _ = monitPIDConns.Load().(int)
 
-			data.OS.CPU = monitOsCpu.Load().(float64)
-			data.OS.RAM = monitOsRam.Load().(uint64)
-			data.OS.Conns = monitOsConns.Load().(int)
+			data.OS.CPU, _ = monitOSCPU.Load().(float64)
+			data.OS.RAM, _ = monitOSRAM.Load().(uint64)
+			data.OS.TotalRAM, _ = monitOSTotalRAM.Load().(uint64)
+			data.OS.LoadAvg, _ = monitOSLoadAvg.Load().(float64)
+			data.OS.Conns, _ = monitOSConns.Load().(int)
 			mutex.Unlock()
 			return c.Status(fiber.StatusOK).JSON(data)
 		}
-		c.Response().Header.SetContentType(fiber.MIMETextHTMLCharsetUTF8)
-		return c.Status(fiber.StatusOK).Send(index)
+		c.Set(fiber.HeaderContentType, fiber.MIMETextHTMLCharsetUTF8)
+		return c.Status(fiber.StatusOK).SendString(cfg.index)
 	}
 }
 
 func updateStatistics(p *process.Process) {
-	pidCpu, _ := p.CPUPercent()
-	monitPidCpu.Store(pidCpu / 10)
+	pidCPU, err := p.CPUPercent()
+	if err == nil {
+		monitPIDCPU.Store(pidCPU / 10)
+	}
 
-	osCpu, _ := cpu.Percent(0, false)
-	monitOsCpu.Store(osCpu[0])
+	if osCPU, err := cpu.Percent(0, false); err == nil && len(osCPU) > 0 {
+		monitOSCPU.Store(osCPU[0])
+	}
 
-	pidMem, _ := p.MemoryInfo()
-	monitPidRam.Store(pidMem.RSS)
+	if pidRAM, err := p.MemoryInfo(); err == nil && pidRAM != nil {
+		monitPIDRAM.Store(pidRAM.RSS)
+	}
 
-	osMem, _ := mem.VirtualMemory()
-	monitOsRam.Store(osMem.Used)
+	if osRAM, err := mem.VirtualMemory(); err == nil && osRAM != nil {
+		monitOSRAM.Store(osRAM.Used)
+		monitOSTotalRAM.Store(osRAM.Total)
+	}
 
-	pidConns, _ := net.ConnectionsPid("tcp", p.Pid)
-	monitPidConns.Store(len(pidConns))
+	if loadAvg, err := load.Avg(); err == nil && loadAvg != nil {
+		monitOSLoadAvg.Store(loadAvg.Load1)
+	}
 
-	osConns, _ := net.Connections("tcp")
-	monitOsConns.Store(len(osConns))
+	pidConns, err := net.ConnectionsPid("tcp", p.Pid)
+	if err == nil {
+		monitPIDConns.Store(len(pidConns))
+	}
+
+	osConns, err := net.Connections("tcp")
+	if err == nil {
+		monitOSConns.Store(len(osConns))
+	}
 }
